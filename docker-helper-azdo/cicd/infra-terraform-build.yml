@@ -1,0 +1,143 @@
+parameters:
+  - name: environment
+    type: string
+    default: "tst"
+    values:
+    - "tst"
+    - "accp"
+    - "dev"
+
+
+  - name: configFile
+    type: string
+    default: "not_set"
+    values:
+    - "tst.tfvars"
+    - "dev.tfvars"
+    - "accp.tfvars"
+
+  - name: deploymentBranch
+    type: string
+    default: "develop"
+    values:
+    - "develop"
+    - "master"
+    - "release"
+    
+
+stages:
+  - stage: Build_${{ replace(parameters.platform, '.', '_') }}_${{ parameters.environment }}_${{ parameters.client }}
+    displayName: "Build ${{ parameters.platform }} for ${{ parameters.environment }}-${{ parameters.client }}"
+    condition: not(failed())
+
+    variables:
+      - name: platform
+        value: "${{ parameters.platform }}"
+      - name: tfvars_file
+        value: "${{ parameters.configFile }}"
+      #- name: environment
+      #  ${{ if eq(contains(variables.region, 'montreal'), true) }}:
+      #    value: "${{ replace(parameters.environment, 'dr', '') }}"
+      #  ${{ if ne(contains(variables.region, 'montreal'), true) }}:
+      #    value: "${{ parameters.environment }}"
+
+    jobs:
+      - job: Build
+        displayName: 'Build Terraform State for ${{ parameters.environment }}-${{ parameters.client }}'
+        variables:
+          prpatch: $[counter(variables['System.PullRequest.PullRequestId'], 1)]
+          brpatch: $[counter(variables['build.sourcebranchname'], 1)]
+        workspace:
+          clean: all
+        pool:
+          name: $(buildPoolName)
+
+        steps:
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                if [[ $BUILD_REASON == 'PullRequest' ]]; then
+                  echo "Set PR Build name"
+                  echo "##vso[build.updatebuildnumber]pr$(System.PullRequest.PullRequestId)-$(date +%Y%m%d).$(prpatch)"
+                elif [[ $BUILD_SOURCEBRANCH != 'refs/heads/master' ]]; then
+                  echo "Set Branch Build name"
+                  echo "##vso[build.updatebuildnumber]$(Build.SourceBranchName)-$(date +%Y%m%d).$(brpatch)"
+                else
+                  echo "Set Master build name"
+                  echo "##vso[build.updatebuildnumber]$(date +%Y%m%d).$(brpatch)"
+                fi
+            env:
+              BRANCH_PATCH: $(brpatch)
+              PR_PATCH: $(prpatch)
+            displayName: Set Build Name
+
+          - task: Bash@3
+            inputs:
+              filePath: '$(buildScriptDirectory)/terraform-download.sh'
+            displayName: 'Terraform Download'
+
+          - task: Bash@3
+            inputs:
+              filePath: '$(buildScriptDirectory)/terraform-init.sh'
+              arguments: '$(terraformPlanDirectory) $(platform) $(environment) $(region)'
+              failOnStderr: true
+            env:
+              ARM_CLIENT_ID: $(az-client-id)
+              ARM_CLIENT_SECRET: $(az-client-secret)
+              ARM_SUBSCRIPTION_ID: $(az-subscription-id)
+              ARM_TENANT_ID: $(az-tenant-id)
+            displayName: 'Terraform Init'
+
+          - task: Bash@3
+            inputs:
+              filePath: '$(buildScriptDirectory)/terraform-validate.sh'
+              arguments: '$(terraformPlanDirectory) $(platform) $(environment) $(region)'
+              failOnStderr: true
+            env:
+              ARM_CLIENT_ID: $(az-client-id)
+              ARM_CLIENT_SECRET: $(az-client-secret)
+              ARM_SUBSCRIPTION_ID: $(az-subscription-id)
+              ARM_TENANT_ID: $(az-tenant-id)
+            displayName: 'Terraform validate'
+
+          - task: Bash@3
+            inputs:
+              filePath: '$(buildScriptDirectory)/terraform-plan.sh'
+              arguments: '$(terraformPlanDirectory) $(platform) $(environment) $(region) $(tfvars_file)'
+              failOnStderr: true
+            env:
+              ARM_CLIENT_ID: $(az-client-id)
+              ARM_CLIENT_SECRET: $(az-client-secret)
+              ARM_SUBSCRIPTION_ID: $(az-subscription-id)
+              ARM_TENANT_ID: $(az-tenant-id)
+              TF_VAR_region: $(oci-region)
+              TF_VAR_fingerprint: $(oci-api-key-fingerprint)
+              TF_VAR_tenancy_ocid: $(oci-tenancy-ocid)
+              TF_VAR_user_ocid: $(oci-user-ocid)
+              TF_VAR_user: $(oci-user)
+              TF_VAR_password: $(oci-user-password)
+              TF_VAR_azdo_pat_token: $(azdo-pat-token)
+            displayName: 'Terraform Plan'
+
+          - task: Bash@3
+            condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/${{ parameters.deploymentBranch }}'), and(eq('${{ parameters.client }}', 'equisoft'), eq(variables['Build.Reason'], 'Manual'))))
+            inputs:
+              filePath: '$(buildScriptDirectory)/generate-terraformhtmlplan.sh'
+              arguments: '$(terraformPlanDirectory)/$(platform)/environments/$(environment)/$(region) $(environment) "$(buildURL)"'
+              failOnStderr: true
+            env:
+              ARM_CLIENT_ID: $(az-client-id)
+              ARM_CLIENT_SECRET: $(az-client-secret)
+              ARM_SUBSCRIPTION_ID: $(az-subscription-id)
+              ARM_TENANT_ID: $(az-tenant-id)
+            displayName: 'Generate Terraform Plan HTML Report'
+
+          - task: PublishBuildArtifacts@1
+            condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/${{ parameters.deploymentBranch }}'), and(eq('${{ parameters.client }}', 'equisoft'), eq(variables['Build.Reason'], 'Manual'))))
+            inputs:
+              PathtoPublish: '$(terraformPlanDirectory)'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+            displayName: 'Publish Plan Artifact'
+            
